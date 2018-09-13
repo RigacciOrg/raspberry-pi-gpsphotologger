@@ -1,0 +1,489 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2018 Niccolo Rigacci
+#
+# This script acquires georeferenced photos on a Raspberry Pi.
+# Photos are taken by an instance of the raspistill program,
+# which must be running with the "--signal" parameter.
+# GPS position is provided by a running gpsd instance.
+#
+# System time must be syncronized with the GPS time, so that
+# the exact position of the captured photo will be
+# interpolated by reading subsequent positions coming from
+# the GPS.
+#
+# Debian packages required by this Pyhont script:
+# python-daemon python-gps python-pexif
+#
+# Other required packages:
+# gpsd libraspberrypi-bin ntp
+#
+# This program is free software: you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation, either version 3 of
+# the License, or (at your option) any later version.
+#
+# Author        Niccolo Rigacci <niccolo@rigacci.org>
+#
+# Version 1.0.0  2018-09-13
+
+import argparse, datetime, lockfile, math, os, os.path, gps, shutil, signal, subprocess, sys, time
+import daemon, daemon.pidfile
+import logging, logging.handlers
+
+# Use a custom version of Pexif library for the following issues:
+#  * SEC_DEN too high, causing Exiv2 library overflow
+#  * Missing tags GPSMapDatum, GPSSpeed, GPSTrack, GPSDateStamp, GPSTimeStamp, etc.
+#  * Missing a set_altitude() method
+import my_pexif as pexif
+
+# This is the program name.
+PROG_NAME = "gpsphotologger"
+PID_FILE = "/var/run/%s.pid" % (PROG_NAME)
+
+# Discard photo if GPS fix disappears for N seconds after shooting.
+PHOTO_FIX_TIMEOUT = 10.0
+
+# How much time (seconds) allow for raspistill to finish the capture.
+# It depends upon CPU type, storage speed, raspistill settings, etc.
+CAPTURE_SLEEP = 0.7
+
+# How  many seconds to wait before continue the main loop after an error.
+ERROR_HOLDOFF=20
+
+# Log messages format.
+LOG_FMT_SYSLOG = '%(module)s: %(levelname)s %(message)s'
+LOG_FMT_FILE = '%(asctime)s %(levelname)s %(message)s'
+LOG_FMT_DATE = '%Y-%m-%d %H:%M:%S'
+
+# The session opened with the gpsd instance.
+gpsd_session  = None
+# The PID of raspistill instance, to capture images.
+raspistill_pid = None
+# Set to True when a signal is handled.
+exit_program = False
+
+#-------------------------------------------------------------------------
+# Define a boolean type for argparse.
+#-------------------------------------------------------------------------
+def bool_arg(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+#--------------------------------------------------------------------------
+# Parse command line options.
+#--------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description='Acquires georeferenced photos via raspistill and gpsd.')
+parser.add_argument("-f", type=bool_arg, dest="photo_require_fix", default=True, help="require a GPS fix to take photos (default: True)")
+parser.add_argument("-i", type=int, dest="photo_interval", default=30, help="take a photo every specified seconds (default: 30)")
+parser.add_argument("-d", type=int, dest="photo_distance", default=15, help="take a photo only if moved at least the specified meters (default: 15)")
+parser.add_argument("-s", type=str, dest="tmp_stillimage", default='/dev/shm/stillimage.jpg', help="where raspistill saves captured images (default: /dev/shm/stillimage.jpg)")
+parser.add_argument("-t", type=str, dest="dst_image_dir", default='/DCIM', help="permanent storage for geotagged images (default: /DCIM)")
+parser.add_argument("-b", type=bool_arg, dest="be_daemon", default=True, help="run as a daemon (default: True)")
+parser.add_argument("-v", type=str, dest="log_level", default='INFO', help="one of DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)")
+parser.add_argument("-l", type=str, dest="logfile", default=None, help="log to file instead of syslog (default: None = syslog)")
+args = parser.parse_args()
+
+PHOTO_REQUIRE_FIX = args.photo_require_fix  # Require a GPS fix to take photos.
+PHOTO_INTERVAL    = args.photo_interval     # Take a photo every specified seconds
+PHOTO_DISTANCE    = args.photo_distance     # Take a photo only if moved at least the specified meters.
+BE_DAEMON         = args.be_daemon          # Run as a daemon.
+LOG_LEVEL         = args.log_level          # From the logging module: NOTSET, DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_TO_FILE       = args.logfile            # False for syslog logging, filename for file logging.
+DST_IMAGE_DIR     = args.dst_image_dir      # Permanent storage for geotagged images.
+TMP_STILLIMAGE    = args.tmp_stillimage     # Where raspistill saves captured images (use a RAM filesystem!).
+
+#-------------------------------------------------------------------------
+# Initialize logging.
+#-------------------------------------------------------------------------
+def log_open():
+    if not BE_DAEMON:
+        # Log to stdout.
+        handler = logging.StreamHandler(stream=sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FMT_FILE, LOG_FMT_DATE))
+    elif LOG_TO_FILE:
+        # Log to file.
+        handler = logging.FileHandler(filename=LOG_TO_FILE)
+        handler.setFormatter(logging.Formatter(LOG_FMT_FILE, LOG_FMT_DATE))
+    else:
+        # Log to syslog.
+        handler = logging.handlers.SysLogHandler(address='/dev/log')
+        handler.setFormatter(logging.Formatter(LOG_FMT_SYSLOG, LOG_FMT_DATE))
+
+    log = logging.getLogger()
+    log.setLevel(LOG_LEVEL)
+    log.addHandler(handler)
+
+#-------------------------------------------------------------------------
+# Connect to the GPS daemon.
+#-------------------------------------------------------------------------
+def gpsd_connect():
+    logging.info("Opening GPS session")
+    try:
+        gpsd = gps.gps("localhost", "2947")
+        gpsd.stream(gps.WATCH_ENABLE | gps.WATCH_NEWSTYLE)
+    except:
+        gpsd = None
+    return gpsd
+
+#-------------------------------------------------------------------------
+# Find the process ID of the raspistill instance.
+#-------------------------------------------------------------------------
+def get_raspistill_pid():
+    process_name = 'raspistill'
+    try:
+        pidof = map(int, subprocess.check_output(['pidof', process_name]).split())
+        if len(pidof) > 1:
+            logging.warning("Found multiple instances of %s, PID: %s" % (process_name, pidof))
+        pid = pidof[0]
+        logging.info("Found %s process running with PID %d" % (process_name, pid))
+        return pid
+    except Exception, e:
+        logging.error("Cannot find the PID of process %s: %s" % (process_name, str(e)))
+        return None
+
+#-------------------------------------------------------------------------
+# A class to store a GPS fix.
+#-------------------------------------------------------------------------
+class GpsFix:
+    def __init__(self, time=None, lat=None, lon=None, alt=None, speed=None, climb=None, track=None):
+        self.time = time
+        self.lat = lat
+        self.lon = lon
+        self.alt = alt
+        self.speed = speed
+        self.climb = climb
+        self.track = track
+    def __str__(self):
+        return "%s %s %s %s %s %s %s" % (self.time, self.lat, self.lon,
+            self.alt, self.speed, self.climb, self.track)
+
+#-------------------------------------------------------------------------
+# Use the haversine formula to calculate distance (m) between GPS points.
+#-------------------------------------------------------------------------
+def gpsfix_distance(fix0, fix1):
+    R = 6367444.5 # Approximate radius of earth in m
+    lat0 = math.radians(fix0.lat)
+    lon0 = math.radians(fix0.lon)
+    lat1 = math.radians(fix1.lat)
+    lon1 = math.radians(fix1.lon)
+    dlat = lat1 - lat0
+    dlon = lon1 - lon0
+    a = math.sin(dlat / 2)**2 + math.cos(lat0) * math.cos(lat1) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    distance = R * c
+    return distance
+
+#-------------------------------------------------------------------------
+# Linear interpolation between two GPS points, at an intermediate time.
+#-------------------------------------------------------------------------
+def gpsfix_interpolate(fix0, fix1, time_i):
+    interp = GpsFix(time=time_i)
+    td = (fix1.time - fix0.time).total_seconds()
+    ti = (time_i - fix0.time).total_seconds()
+    t = ti / td
+    for attr in  ['alt', 'climb', 'lat', 'lon', 'speed']:
+        if getattr(fix0, attr) != None and getattr(fix1, attr) != None:
+            val = (1.0 - t) * getattr(fix0, attr) + t * getattr(fix1, attr)
+            setattr(interp, attr, val)
+    # Track (0 >= track < 360) should be interpolated differently!
+    if fix0.track != None and fix1.track != None:
+        if fix1.track < fix0.track:
+            fix1.track += 360
+        if (fix1.track - fix0.track) > 180:
+            d = fix1.track - fix0.track - 360
+        else:
+            d = fix1.track - fix0.track
+        interp.track = (fix0.track + t * d) % 360
+
+    logging.debug("Interpolated GpsFix: %s" % (interp,))
+    logging.debug("Interpolating time %s, between %s and %s" % (time_i.strftime('%H:%M:%S.%f'), fix0.time.strftime('%H:%M:%S.%f'), fix1.time.strftime('%H:%M:%S.%f')))
+    logging.debug("Interpolating factor t = %f" % (t,))
+    logging.debug("Interpolated lat %f, between %f and %f" % (interp.lat, fix0.lat, fix1.lat))
+    logging.debug("Interpolated lon %f, between %f and %f" % (interp.lon, fix0.lon, fix1.lon))
+    if fix0.alt != None and fix1.alt != None:
+        logging.debug("Interpolated alt %.2f, between %.2f and %.2f" % (interp.alt, fix0.alt, fix1.alt))
+    if fix0.track != None and fix1.track != None:
+        logging.debug("Interpolated track %.2f, between %.2f and %.2f" % (interp.track, fix0.track, fix1.track))
+    return interp
+
+#-------------------------------------------------------------------------
+# Return a GpsFix class from gpsd TPV report. "time", "lat" and "lon"
+# attributes are mandatory, the others can be None (2D fix mode, etc).
+# Return None on errors (no fix, missing data, etc).
+#-------------------------------------------------------------------------
+def parse_gps_tpv(report):
+    fix = GpsFix()
+    if hasattr(report, 'mode'):
+        if report.mode != gps.MODE_2D and report.mode != gps.MODE_3D:
+            return None
+    if hasattr(report, 'time') and hasattr(report, 'lat') and hasattr(report, 'lon'):
+        try:
+            # report.time: '2018-09-01T03:47:29.000Z'
+            fix.time = datetime.datetime.strptime(report.time, '%Y-%m-%dT%H:%M:%S.%fZ')
+        except:
+            logging.error("Error parsing TPV time: %s" % (report.time,))
+            return None
+        try:
+            fix.lat = float(report.lat)
+            fix.lon = float(report.lon)
+        except:
+            logging.error("Error parsing TPV (lat, lon): (%s, %s)" % (report.lat, report.lon))
+            return None
+        for attr in ['alt', 'climb', 'speed', 'track']:
+            if hasattr(report, attr):
+                try:
+                    setattr(fix, attr, float(getattr(report, attr)))
+                except:
+                    continue
+        logging.debug("Parsed GpsFix: %s" % (fix,))
+        return fix
+    else:
+        return None
+
+#-------------------------------------------------------------------------
+# Send signal SIGUSR1 to a raspistill instance to capture an image.
+# Return the estimated capture time (datetime) or None if errors.
+#-------------------------------------------------------------------------
+def image_capture():
+    global raspistill_pid
+    if not raspistill_pid:
+        logging.error("raspistill PID is unknown, cannot capture image")
+        return None
+    if os.path.exists(TMP_STILLIMAGE):
+        os.unlink(TMP_STILLIMAGE)
+    t0 = datetime.datetime.utcnow()
+    logging.debug("Image capture: sending SIGUSR1 to PID %d, at %s" % (raspistill_pid, t0))
+    try:
+        os.kill(raspistill_pid, signal.SIGUSR1)
+    except Exception, e:
+        logging.error("Error sending SIGUSR1 to raspistill: %s" % (str(e),))
+        raspistill_pid = None
+        return None
+    # Wait for the image to be fully saved (adjust on your system!).
+    time.sleep(CAPTURE_SLEEP)
+    if not os.path.exists(TMP_STILLIMAGE):
+        logging.error("Temporary file '%s' does not exists after capture" % (TMP_STILLIMAGE,))
+        return None
+    # Get the modification timestamp of file.
+    t1 = datetime.datetime.utcfromtimestamp(os.path.getmtime(TMP_STILLIMAGE))
+    elapsed_time = t1 - t0
+    capture_time = t0 + (elapsed_time) / 2
+    logging.debug("Image acquired in %d.%06d seconds" % (elapsed_time.seconds, elapsed_time.microseconds,))
+    return capture_time
+
+#-------------------------------------------------------------------------
+# Add GPS tags (if any) to image and save it to permanent storage.
+#-------------------------------------------------------------------------
+def image_save(img_fix=None):
+    img_name = datetime.datetime.utcnow().strftime("img_%Y%m%d%H%M%SZ.jpg")
+    dst_file = os.path.join(DST_IMAGE_DIR, img_name)
+    if img_fix != None:
+        logging.debug("Saving image '%s' with GPS Exif data" % (img_name,))
+        try:
+            img = pexif.JpegFile.fromFile(TMP_STILLIMAGE)
+        except Exception, e:
+            logging.error("pexif.JpegFile.fromFile(): %s" % (str(e),))
+            return
+        img.set_geo(img_fix.lat, img_fix.lon)
+        img.exif.primary.GPS.GPSMapDatum = 'WGS-84'
+        if img_fix.alt != None:
+            img.set_altitude(img_fix.alt)
+        if img_fix.speed != None:
+            # Speed of movement, in km/h.
+            img.exif.primary.GPS.GPSSpeedRef = 'K'
+            img.exif.primary.GPS.GPSSpeed = [pexif.Rational(img_fix.speed * 10, 10)]
+        if img_fix.track != None:
+            # Direction of movement, in true direction.
+            img.exif.primary.GPS.GPSTrackRef = 'T'
+            img.exif.primary.GPS.GPSTrack = [pexif.Rational(img_fix.track * 10, 10)]
+            # Store the same also as GPSImgDirection, supposing camera is facing forward!
+            img.exif.primary.GPS.GPSImgDirectionRef = 'T'
+            img.exif.primary.GPS.GPSImgDirection = [pexif.Rational(img_fix.track * 10, 10)]
+        img.exif.primary.GPS.GPSDateStamp = img_fix.time.strftime("%Y:%m:%d")
+        img.set_timestamp(img_fix.time.hour, img_fix.time.minute, img_fix.time.second)
+        # TODO: Where to store climb?
+        try:
+            img.writeFile(dst_file)
+        except Exception, e:
+            logging.error("img.writeFile(): %s" % (str(e),))
+            return
+    else:
+        logging.debug("Saving image '%s' with no GPS Exif data" % (img_name,))
+        try:
+            shutil.copyfile(TMP_STILLIMAGE, dst_file)
+        except:
+            logging.error("Cannot copy image in destination dir")
+
+#-------------------------------------------------------------------------
+# Close the connection with gpsd and sleep for capture interval.
+#-------------------------------------------------------------------------
+def main_loop_sleep():
+    global gpsd_session
+    gpsd_session.close()
+    gpsd_session = None
+    logging.debug("Sleeping %.1f seconds for next image" % (PHOTO_INTERVAL,))
+    time.sleep(PHOTO_INTERVAL)
+
+#-------------------------------------------------------------------------
+# Main loop.
+#-------------------------------------------------------------------------
+def program_main():
+
+    global exit_program, gpsd_session, raspistill_pid
+    gps_fix = None
+    image_captured = False
+    capture_prev = GpsFix(time=datetime.datetime.utcnow(), lat=0.0, lon=0.0, alt=0.0)
+
+    while not exit_program:
+
+        if raspistill_pid == None:
+            raspistill_pid = get_raspistill_pid()
+            if not raspistill_pid:
+                logging.error("Capture program not running. Sleeping %d seconds" % (ERROR_HOLDOFF,))
+                time.sleep(ERROR_HOLDOFF)
+                continue
+
+        # Try to get a TPV report from GPS and store it into gps_fix.
+        if gpsd_session == None:
+            gpsd_session = gpsd_connect()
+        try:
+            report = gpsd_session.next()
+            if gpsd_session.fix.mode == gps.MODE_NO_FIX:
+                fix_mode = 'NO'
+            elif gpsd_session.fix.mode == gps.MODE_2D:
+                fix_mode = '2D'
+            elif gpsd_session.fix.mode == gps.MODE_3D:
+                fix_mode = '3D'
+            else:
+                mode = 'UNKNOWN'
+            logging.debug("Got GPS report type %s. Satellite fix: %s" % (report['class'], fix_mode))
+            if report['class'] == 'TPV':
+                gps_fix = parse_gps_tpv(report)
+                if gps_fix != None:
+                    logging.info("Got time-position fix: %s, %0.6f, %0.6f, %s" % (
+                        gps_fix.time, gps_fix.lat, gps_fix.lon, gps_fix.alt))
+        except StopIteration:
+            gps_fix = None
+            gpsd_session = None
+            logging.info("GPSD has terminated")
+            logging.debug("Sleeping %d seconds" % (ERROR_HOLDOFF,))
+            time.sleep(ERROR_HOLDOFF)
+            continue
+
+        if (not image_captured) and ((gps_fix == None) and (not PHOTO_REQUIRE_FIX)):
+            logging.info("Capturing and saving image with no GPS fix")
+            if image_capture():
+                image_save()
+            main_loop_sleep()
+
+        if (not image_captured) and (gps_fix != None):
+            logging.info("Capturing image with GPS fix")
+            fix0 = gps_fix
+            gps_fix = None
+            capture_time = image_capture()
+            if capture_time != None:
+                logging.info("Estimated capture timestamp: %s" % (capture_time,))
+                if capture_time < fix0.time:
+                    logging.error("Discarding image: capture time is prior than GPS fix")
+                    main_loop_sleep()
+                else:
+                    image_captured = True
+            else:
+                logging.error("Image capture failed")
+                main_loop_sleep()
+
+        if image_captured and (gps_fix != None):
+            fix1 = gps_fix
+            gps_fix = None
+            if fix1.time == fix0.time or fix1.time < capture_time:
+                logging.debug("GPS fix time lower than requested, wait next")
+                continue
+            capture_fix = gpsfix_interpolate(fix0, fix1, capture_time)
+            distance_moved = gpsfix_distance(capture_prev, capture_fix)
+            if distance_moved < PHOTO_DISTANCE:
+                logging.info("Not saving image because moved only %.1f m (< %.1f)" % (distance_moved, PHOTO_DISTANCE))
+            else:
+                logging.info("Moved %.1f m: saving image with interpolated GPS fix" % (distance_moved))
+                image_save(capture_fix)
+            capture_prev = capture_fix
+            fix0 = None
+            fix1 = None
+            image_captured = False
+            main_loop_sleep()
+
+        if image_captured and (gps_fix == None):
+            elapsed = datetime.datetime.utcnow() - fix0.time
+            if elapsed.seconds > PHOTO_FIX_TIMEOUT:
+                logging.info("GPS fix is lost: discarding captured image")
+                image_captured = False
+                main_loop_sleep()
+
+#-------------------------------------------------------------------------
+# Handle SIGTERM and SIGINT signals.
+#-------------------------------------------------------------------------
+def program_exit(signum, frame):
+    global exit_program
+    logging.info("Received signal %s" % (signum,))
+    exit_program = True
+
+#-------------------------------------------------------------------------
+# Initialize logging.
+#-------------------------------------------------------------------------
+def log_open():
+    if not BE_DAEMON:
+        # Log to stdout.
+        handler = logging.StreamHandler(stream=sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FMT_FILE, LOG_FMT_DATE))
+    elif LOG_TO_FILE:
+        # Log to file.
+        handler = logging.FileHandler(filename=LOG_TO_FILE)
+        handler.setFormatter(logging.Formatter(LOG_FMT_FILE, LOG_FMT_DATE))
+    else:
+        # Log to syslog.
+        handler = logging.handlers.SysLogHandler(address='/dev/log')
+        handler.setFormatter(logging.Formatter(LOG_FMT_SYSLOG, LOG_FMT_DATE))
+
+    log = logging.getLogger()
+    log.setLevel(LOG_LEVEL)
+    log.addHandler(handler)
+
+#-------------------------------------------------------------------------
+# Entry point.
+#-------------------------------------------------------------------------
+
+# Prepare daemon context.
+context = daemon.DaemonContext(
+    working_directory = '/tmp',
+    umask = 0o002,
+    pidfile= daemon.pidfile.PIDLockFile(PID_FILE),
+    signal_map = {
+        signal.SIGHUP:  program_exit,
+        signal.SIGINT:  program_exit,
+        signal.SIGTERM: program_exit}
+)
+
+if BE_DAEMON:
+    log_opened = False
+    try:
+        with context:
+            log_open()
+            log_opened = True
+            logging.info("Running as daemon with PID %d" % (os.getpid(),))
+            program_main()
+    except Exception as ex:
+        if not log_opened:
+            log_open()
+        logging.error("type %s: %s" % (type(ex), ex.__str__()))
+
+else:
+    log_open()
+    logging.info("Running in foreground")
+    program_main()
+
+logging.info("Exiting program PID %d" % (os.getpid(),))

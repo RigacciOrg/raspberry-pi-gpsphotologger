@@ -1,5 +1,7 @@
-# raspberry-pi-gpsphotologger
-Python script to take georeferenced photos on a Raspberry Pi, using raspistill and gpsd.
+# A GPS Photo Logger for the Raspberry Pi
+
+Python script to take georeferenced photos on a Raspberry Pi, 
+using raspistill and gpsd.
 
 This script acquires georeferenced photos on a Raspberry Pi. 
 Photos are taken by an instance of the **raspistill** program, 
